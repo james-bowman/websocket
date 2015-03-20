@@ -12,6 +12,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"encoding/base64"
+	"fmt"
+	"bufio"
 )
 
 // ErrBadHandshake is returned when the server response to opening handshake is
@@ -179,9 +182,20 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 		netDial = netDialer.Dial
 	}
 
-	netConn, err := netDial("tcp", hostPort)
+	// setup proxy
+	// TODO
+	cm, err := connectMethodForRequest(u, hostPort, requestHeader)
+
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("Error getting connect Method for %s: %v", hostPort, err)
+	}
+
+	netConn, err := netDial("tcp", cm.addr())
+	if err != nil {
+		if cm.proxyURL != nil {
+			err = fmt.Errorf("error connecting to proxy %s: %v", cm.proxyURL, err)
+		}
+		return nil, nil, fmt.Errorf("Error during dial to %s: %v", cm.addr(), err)
 	}
 
 	defer func() {
@@ -189,6 +203,45 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 			netConn.Close()
 		}
 	}()
+
+	// Proxy setup.
+	switch {
+	case cm.proxyURL == nil:
+		// Do nothing. Not using a proxy.
+/*	
+	case cm.targetScheme == "ws":
+		pconn.isProxy = true
+		if pa := cm.proxyAuth(); pa != "" {
+			pconn.mutateHeaderFunc = func(h Header) {
+				h.Set("Proxy-Authorization", pa)
+			}
+		}
+*/	
+	case cm.targetScheme == "wss":
+		connectReq := &http.Request{
+			Method: "CONNECT",
+			URL:    &url.URL{Opaque: cm.targetAddr},
+			Host:   cm.targetAddr,
+			Header: make(http.Header),
+		}
+		if pa := cm.proxyAuth(); pa != "" {
+			connectReq.Header.Set("Proxy-Authorization", pa)
+		}
+		connectReq.Write(netConn)
+
+		// Read response.
+		// Okay to use and discard buffered reader here, because
+		// TLS server will not speak until spoken to.
+		br := bufio.NewReader(netConn)
+		resp, err := http.ReadResponse(br, connectReq)
+		if err != nil {
+			return nil, nil, fmt.Errorf("Error reading response %s: %v", hostPort, err)
+		}
+		if resp.StatusCode != 200 {
+			f := strings.SplitN(resp.Status, " ", 2)
+			return nil, nil, errors.New(f[1])
+		}
+	}
 
 	if err := netConn.SetDeadline(deadline); err != nil {
 		return nil, nil, err
@@ -233,3 +286,75 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 	netConn = nil // to avoid close in defer.
 	return conn, resp, nil
 }
+
+func connectMethodForRequest(u *url.URL, hostPort string, requestHeader http.Header) (cm connectMethod, err error) {
+	req := &http.Request{
+			Method: "GET",
+			URL:    u,
+			Host:   hostPort,
+			Header: requestHeader,
+	}
+
+	cm.targetScheme = u.Scheme
+	cm.targetAddr = canonicalAddr(u)
+	cm.proxyURL, err = http.ProxyFromEnvironment(req)
+	return cm, err
+}
+
+type connectMethod struct {
+	proxyURL     *url.URL // nil for no proxy, else full proxy URL
+	targetScheme string   // "http" or "https"
+	targetAddr   string   // Not used if proxy + http targetScheme (4th example in table)
+}
+
+// proxyAuth returns the Proxy-Authorization header to set
+// on requests, if applicable.
+func (cm *connectMethod) proxyAuth() string {
+	if cm.proxyURL == nil {
+		return ""
+	}
+	if u := cm.proxyURL.User; u != nil {
+		username := u.Username()
+		password, _ := u.Password()
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	}
+	return ""
+}
+
+// addr returns the first hop "host:port" to which we need to TCP connect.
+func (cm *connectMethod) addr() string {
+	if cm.proxyURL != nil {
+		return canonicalAddr(cm.proxyURL)
+	}
+	return cm.targetAddr
+}
+
+// tlsHost returns the host name to match against the peer's
+// TLS certificate.
+func (cm *connectMethod) tlsHost() string {
+	h := cm.targetAddr
+	if hasPort(h) {
+		h = h[:strings.LastIndex(h, ":")]
+	}
+	return h
+}
+
+var portMap = map[string]string{
+	"http":  "80",
+	"https": "443",
+	"ws": "80",
+	"wss": "443",
+}
+
+// canonicalAddr returns url.Host but always with a ":port" suffix
+func canonicalAddr(url *url.URL) string {
+	addr := url.Host
+	if !hasPort(addr) {
+		return addr + ":" + portMap[url.Scheme]
+	}
+	return addr
+}
+
+// Given a string of the form "host", "host:port", or "[ipv6::address]:port",
+// return true if the string includes a port.
+func hasPort(s string) bool { return strings.LastIndex(s, ":") > strings.LastIndex(s, "]") }
